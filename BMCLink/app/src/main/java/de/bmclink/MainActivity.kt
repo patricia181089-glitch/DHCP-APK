@@ -1,6 +1,7 @@
 package de.bmclink
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Color
@@ -52,6 +53,16 @@ class MainActivity : Activity() {
     private lateinit var resultList: LinearLayout
     private lateinit var resultHint: TextView
     private lateinit var logText: TextView
+    private lateinit var swAddrEdit: EditText
+    private lateinit var swUserEdit: EditText
+    private lateinit var swPassEdit: EditText
+    private lateinit var swChanEdit: EditText
+    private lateinit var swIpEdit: EditText
+    private lateinit var swMaskEdit: EditText
+    private lateinit var swGwEdit: EditText
+    private lateinit var swList: LinearLayout
+    private lateinit var swSearchButton: Button
+    @Volatile private var swBusy = false
 
     // ---- Zustand ----
     @Volatile private var rootOk = false
@@ -170,6 +181,44 @@ class MainActivity : Activity() {
             c.addView(dim("DHCP-Server: Alternative zum Tethering, wenn der BMC auf DHCP steht. " +
                     "Vergibt Adressen .100–.199 im Netz der Handy-IP."))
             c.addView(button("Alles zurücksetzen", danger = true) { resetAll() })
+        }
+
+        // ---------- Switchboard / IPMI ----------
+        card(root, "Switchboard-IP ändern (IPMI, z. B. Inspur M5)") { c ->
+            c.addView(dim("Für BMCs mit unbekannter IP, wenn DHCP nicht geht (z. B. Switchboard-BMC fürs CPLD-Update). " +
+                    "Kabel direkt in den Management-Port des Switchboards. Die Suche findet den BMC über IPv6 link-local " +
+                    "(fe80::…) – dafür muss die IPv4 nicht passen. Mit Root klappt das am zuverlässigsten."))
+            swSearchButton = button("1. Switchboard suchen") { swSearch() }.also { c.addView(it) }
+            swList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            c.addView(swList)
+
+            c.addView(label("BMC-Adresse (fe80::…%eth0 oder IPv4)"))
+            swAddrEdit = edit("").also { it.hint = "wird bei der Suche ausgefüllt"; c.addView(it) }
+            val cred = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            swUserEdit = edit("admin")
+            swPassEdit = edit("admin").also {
+                it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            cred.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; addView(label("Benutzer")); addView(swUserEdit)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) })
+            cred.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; addView(label("Passwort")); addView(swPassEdit)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            c.addView(cred)
+            c.addView(button("2. Konfiguration lesen") { swRead() })
+
+            c.addView(label("LAN-Kanal (leer = automatisch)"))
+            swChanEdit = edit("").also { it.inputType = InputType.TYPE_CLASS_NUMBER; c.addView(it) }
+            c.addView(label("Neue IP"))
+            swIpEdit = edit("").also { it.inputType = InputType.TYPE_CLASS_PHONE; it.hint = "z. B. 192.168.1.50"; c.addView(it) }
+            c.addView(label("Subnetzmaske"))
+            swMaskEdit = edit("255.255.255.0").also { it.inputType = InputType.TYPE_CLASS_PHONE; c.addView(it) }
+            c.addView(label("Gateway"))
+            swGwEdit = edit("0.0.0.0").also { it.inputType = InputType.TYPE_CLASS_PHONE; c.addView(it) }
+            c.addView(button("3. IP am Switchboard setzen") { swSet(dhcp = false) })
+            c.addView(button("4. Handy ins neue Netz + Weboberfläche öffnen") { swConnect() })
+            c.addView(button("Switchboard zurück auf DHCP", danger = true) { swSet(dhcp = true) })
         }
 
         // ---------- Ergebnisse ----------
@@ -539,6 +588,215 @@ class MainActivity : Activity() {
             val r = RootNet.teardown(iface, ip)
             ui.post { log(if (r.code == 0) "✔ Zurückgesetzt (IP, Routen, DHCP entfernt)." else "Zurücksetzen: ${r.out}"); refreshStatus() }
         }.start()
+    }
+
+    // =====================================================================
+    // Switchboard / IPMI
+    // =====================================================================
+
+    /** Bindet einen UDP-Socket an das Android-Netz des Adapters (falls es eins gibt). */
+    private fun binder(): (java.net.DatagramSocket) -> Unit {
+        val net = NetInfo.list(this).firstOrNull { it.name == iface() }?.network
+        return { s ->
+            if (net != null && android.os.Build.VERSION.SDK_INT >= 22) try {
+                net.bindSocket(s)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun swBegin(): Boolean {
+        if (swBusy) {
+            toast("Läuft noch …"); return false
+        }
+        swBusy = true
+        return true
+    }
+
+    private fun swSearch() {
+        if (!swBegin()) return
+        val iface = iface()
+        swSearchButton.text = "Suche läuft …"
+        swList.removeAllViews()
+        log("Switchboard-Suche auf $iface (IPv6 link-local + IPMI-Ping) …")
+        Thread {
+            val hits = LinkedHashMap<String, String>()   // Adresse -> Beschreibung
+            try {
+                if (rootOk || Root.available(force = true).also { rootOk = it }) {
+                    val (neigh, _) = RootNet.v6Neighbors(iface)
+                    for ((a, mac) in neigh) hits["$a%$iface"] = "MAC $mac · antwortet auf Ping"
+                }
+                for ((a, mac) in Ipmi.discover(iface, 3000, binder())) {
+                    hits[a] = listOfNotNull(mac?.let { "MAC $it" }, "IPMI ✔").joinToString(" · ")
+                }
+            } catch (e: Exception) {
+                ui.post { log("✖ Suche: ${e.message}") }
+            }
+            ui.post {
+                swBusy = false
+                swSearchButton.text = "1. Switchboard suchen"
+                if (hits.isEmpty()) {
+                    log("✖ Nichts gefunden. Kabel im Management-Port? Link-LED an? BMC fertig gebootet (2–3 min)? " +
+                            "Ohne Root: Ethernet-Tethering einschalten, damit der Adapter aktiv ist.")
+                    return@post
+                }
+                log("✔ ${hits.size} Kandidat(en) gefunden. Antworten mit „IPMI ✔“ sind sicher BMCs.")
+                val best = hits.entries.firstOrNull { "IPMI" in it.value } ?: hits.entries.first()
+                swAddrEdit.setText(best.key)
+                for ((a, d) in hits) swList.addView(swRow(a, d))
+            }
+        }.start()
+    }
+
+    private fun swRow(addr: String, desc: String): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val txt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        txt.addView(text(addr, cAccent).apply { textSize = 12.5f; setTypeface(Typeface.MONOSPACE, Typeface.BOLD) })
+        txt.addView(dim(desc))
+        row.addView(txt, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(Button(this).apply {
+            text = "Wählen"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#0B1A12"))
+            background = GradientDrawable().apply { cornerRadius = dp(10).toFloat(); setColor(cAccent) }
+            setOnClickListener { swAddrEdit.setText(addr) }
+        }, LinearLayout.LayoutParams(dp(88), dp(40)))
+        return row
+    }
+
+    private fun swRead() {
+        val addr = swAddrEdit.text.toString().trim()
+        if (addr.isEmpty()) {
+            log("✖ Erst suchen oder eine BMC-Adresse eintragen."); return
+        }
+        if (!swBegin()) return
+        val user = swUserEdit.text.toString().trim()
+        val pass = swPassEdit.text.toString()
+        val bind = binder()
+        log("Verbinde per IPMI mit $addr …")
+        Thread {
+            try {
+                Ipmi(addr, user, pass, bind = bind).open().use { b ->
+                    val infos = b.lanChannels().map { b.lanInfo(it) }
+                    ui.post {
+                        log("✔ Angemeldet (Cipher-Suite ${b.suite}).")
+                        infos.forEach { log("   $it") }
+                        if (swChanEdit.text.isBlank()) swChanEdit.setText(infos.first().channel.toString())
+                        if (swIpEdit.text.isBlank()) swIpEdit.setText(suggestIp(infos.first()))
+                        val cur = infos.first()
+                        if (cur.mask != "?" && cur.mask != "0.0.0.0" && swMaskEdit.text.toString() == "255.255.255.0") swMaskEdit.setText(cur.mask)
+                    }
+                }
+            } catch (e: Exception) {
+                ui.post { log("✖ ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                swBusy = false
+            }
+        }.start()
+    }
+
+    /** Vorschlag für die neue IP: ins Netz des Adapters (z. B. Tethering), sonst aktuelle IP, sonst 192.168.1.50. */
+    private fun suggestIp(cur: LanInfo): String {
+        val own = NetInfo.list(this).firstOrNull { it.name == iface() }?.addrs?.firstOrNull()
+        if (own != null) {
+            val cand = own.network + 200
+            if (own.contains(cand) && cand != own.addr) {
+                swMaskEdit.setText(intToIp(own.mask))
+                return intToIp(cand)
+            }
+        }
+        if (cur.ip != "?" && cur.ip != "0.0.0.0") return cur.ip
+        return "192.168.1.50"
+    }
+
+    private fun swSet(dhcp: Boolean) {
+        val chText = swChanEdit.text.toString().trim()
+        val ip = swIpEdit.text.toString().trim()
+        val mask = swMaskEdit.text.toString().trim()
+        val gw = swGwEdit.text.toString().trim().ifEmpty { "0.0.0.0" }
+        if (!dhcp) {
+            if (ipToInt(ip) == null) { log("✖ Neue IP ungültig."); return }
+            if (ipToInt(mask) == null) { log("✖ Maske ungültig."); return }
+            if (ipToInt(gw) == null) { log("✖ Gateway ungültig."); return }
+        }
+        val what = if (dhcp) "auf DHCP stellen" else "auf $ip / $mask (GW $gw) setzen"
+        AlertDialog.Builder(this)
+            .setTitle("Switchboard-IP ändern?")
+            .setMessage("Kanal ${chText.ifEmpty { "automatisch" }} $what.\n\n" +
+                    "Die Verbindung über fe80::… bleibt dabei bestehen.")
+            .setPositiveButton("Ja, setzen") { _, _ -> swDoSet(chText.toIntOrNull(), dhcp, ip, mask, gw) }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    private fun swDoSet(chIn: Int?, dhcp: Boolean, ip: String, mask: String, gw: String) {
+        val addr = swAddrEdit.text.toString().trim()
+        if (addr.isEmpty()) {
+            log("✖ Erst suchen oder eine BMC-Adresse eintragen."); return
+        }
+        if (!swBegin()) return
+        val user = swUserEdit.text.toString().trim()
+        val pass = swPassEdit.text.toString()
+        val bind = binder()
+        log(if (dhcp) "Stelle Switchboard auf DHCP …" else "Setze Switchboard-IP $ip / $mask, GW $gw …")
+        Thread {
+            try {
+                Ipmi(addr, user, pass, bind = bind).open().use { b ->
+                    val ch = chIn ?: b.lanChannels().first()
+                    val before = b.lanInfo(ch)
+                    if (dhcp) b.setDhcp(ch) else b.setStatic(ch, ip, mask, gw)
+                    Thread.sleep(2000)
+                    val after = b.lanInfo(ch)
+                    ui.post {
+                        log("   vorher:  $before")
+                        log("   nachher: $after")
+                        if (!dhcp && after.ip == ip) {
+                            log("✔ Switchboard hat jetzt $ip. Weiter mit Schritt 4.")
+                            toast("Switchboard-IP gesetzt")
+                        } else if (!dhcp) {
+                            log("⚠ Gelesene IP weicht ab – evtl. übernimmt der BMC sie verzögert. Gleich nochmal „Konfiguration lesen“.")
+                        } else {
+                            log("✔ Auf DHCP umgestellt.")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                ui.post { log("✖ ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                swBusy = false
+            }
+        }.start()
+    }
+
+    /** Handy in das Netz der neuen Switchboard-IP bringen und die Weboberfläche öffnen. */
+    private fun swConnect() {
+        val ip = swIpEdit.text.toString().trim()
+        val bmc = ipToInt(ip)
+        val mask = ipToInt(swMaskEdit.text.toString().trim())
+        if (bmc == null || mask == null) {
+            log("✖ Neue IP/Maske im Switchboard-Bereich eintragen."); return
+        }
+        val prefix = Integer.bitCount(mask).coerceIn(8, 30)
+        val own = NetInfo.list(this).firstOrNull { it.name == iface() }?.addrs?.firstOrNull()
+        if (own != null && own.contains(bmc)) {
+            log("Handy ist schon im Netz (${own}). Öffne https://$ip …")
+            openUrl("https://$ip"); return
+        }
+        if (!rootOk) {
+            log("✖ Ohne Root kann das Handy keine feste IP setzen. Tipp: Ethernet-Tethering einschalten, " +
+                    "dann „Konfiguration lesen“ – die vorgeschlagene IP liegt dann im Tethering-Netz.")
+            return
+        }
+        val net = Ipv4(bmc, prefix)
+        val phone = if (net.broadcast - 1 != bmc) net.broadcast - 1 else net.network + 1
+        bmcEdit.setText(ip)
+        phoneEdit.setText("${intToIp(phone)}/$prefix")
+        log("Setze Handy-IP ${intToIp(phone)}/$prefix und öffne danach https://$ip …")
+        applyStaticIp { openUrl("https://$ip") }
     }
 
     // =====================================================================
