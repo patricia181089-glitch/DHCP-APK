@@ -261,6 +261,40 @@ class MainActivity : Activity() {
 
     private fun iface() = ifaceEdit.text.toString().trim().ifEmpty { "eth0" }
 
+    /**
+     * Erkennt den Adapter über die USB-Geräteliste (braucht keine Rechte).
+     * Ab Android 11 sieht eine App Netzwerk-Interfaces ohne IP sonst gar nicht.
+     */
+    private fun usbLanAdapter(): String? = try {
+        val um = getSystemService(USB_SERVICE) as android.hardware.usb.UsbManager
+        um.deviceList.values.firstNotNullOfOrNull { d ->
+            val known = when (d.vendorId) {
+                0x0bda -> "Realtek"
+                0x0b95 -> "ASIX"
+                0x0424 -> "Microchip/SMSC"
+                0x2001 -> "D-Link"
+                0x13b1 -> "Linksys"
+                0x17ef -> "Lenovo"
+                0x04e8 -> "Samsung"
+                0x2357 -> "TP-Link"
+                0x0fe6 -> "Kontron/CoreChips"
+                0x050d -> "Belkin"
+                0x0846 -> "Netgear"
+                0x1c04 -> "QinHeng"
+                0x0b05 -> "ASUS"
+                else -> null
+            }
+            // Netzwerk-Klasse: CDC (2), Vendor-spezifisch (255) bei Realtek/ASIX
+            val isNet = (0 until d.interfaceCount).any {
+                val c = d.getInterface(it).interfaceClass
+                c == 2 || c == 10 || (c == 255 && known != null)
+            }
+            if (isNet && known != null) "USB-LAN-Adapter ($known)" else if (isNet) "USB-Netzwerkgerät" else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     private fun refreshStatus() {
         val list = NetInfo.list(this)
         val sys = NetInfo.sysLanNames()
@@ -271,13 +305,17 @@ class MainActivity : Activity() {
         val cur = list.firstOrNull { it.name == iface() }
         val sb = StringBuilder()
         val color: Int
+        val usb = usbLanAdapter()
         when {
-            cur == null && iface() !in sys -> {
+            cur == null && iface() !in sys && usb == null -> {
                 sb.append("Kein LAN-Adapter erkannt.\nAdapter per OTG einstecken (Handy muss OTG + den Chip unterstützen).")
                 color = cErr
             }
             cur == null || cur.addrs.isEmpty() -> {
-                sb.append("${iface()} erkannt, aber ohne IP.\n→ Fall A: Tethering an · Fall B: Handy-IP setzen")
+                sb.append("${usb ?: iface()} erkannt, aber noch ohne IP.\n" +
+                        "• Server verteilt IPs (z. B. Inspur 126.0.0.x): Tethering AUS lassen, Kabel stecken, ein paar Sekunden warten\n" +
+                        "• BMC wartet auf DHCP: Tethering AN\n" +
+                        "• Feste BMC-IP: Fall B (Root)")
                 color = cWarn
             }
             else -> {
